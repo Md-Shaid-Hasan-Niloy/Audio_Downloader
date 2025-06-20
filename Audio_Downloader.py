@@ -1,3 +1,17 @@
+# ***************************************************************************
+#   Animal Call Audio Downloader
+#   ---------------------------------
+#   Written by: Md Shaid Hasan Niloy
+#   - for -
+#   Mints: Multi-scale Integrated Sensing and Simulation
+#   ---------------------------------
+#   Date: June 19, 2025
+#   ---------------------------------
+#   This module is written to download animal calls from the 
+#   Macaulay Library - https://www.macaulaylibrary.org/ 
+#   and https://xeno-canto.org/
+
+
 import requests
 import os
 import yaml
