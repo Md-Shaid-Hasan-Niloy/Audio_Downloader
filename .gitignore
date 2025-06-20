@@ -1,0 +1,8 @@
+audio_samples/
+*.wav
+*.mp3
+*.json
+credentials.yaml
+__pycache__/
+*.pyc
+.DS_Store
