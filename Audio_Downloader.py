@@ -1,8 +1,8 @@
 # ***************************************************************************
 #   Animal Call Audio Downloader
 #   ---------------------------------
-#   Written by: Md Shaid Hasan Niloy
-#   - for -
+#   
+#   - Written for -
 #   Mints: Multi-scale Integrated Sensing and Simulation
 #   ---------------------------------
 #   Date: June 19, 2025
