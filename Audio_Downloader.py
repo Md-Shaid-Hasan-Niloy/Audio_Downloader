@@ -7,39 +7,38 @@
 #   - Written for -
 #   Mints: Multi-scale Integrated Sensing and Simulation
 #   ---------------------------------
-#   Date: June 19, 2025
+#   Date: July 16, 2025
+
 import requests
 import os
 import yaml
 import pandas as pd
 import time
+import json
 import re
 import duckdb
-import json
 
 # Load credentials
 credentials = yaml.safe_load(open('credentials.yaml'))
 api = credentials['eBirdApiKey']
 
-# Output base folder
-main_audio_folder = "audio_samples"
+# Output folder
+main_audio_folder = "/mnt/mints/audio_samples"
+
 os.makedirs(main_audio_folder, exist_ok=True)
 
-# APIs
+# Macaulay Library API
 MACAULAY_URL = "https://search.macaulaylibrary.org/api/v1/search"
+# Xeno-Canto API
 XENO_CANTO_URL = "https://xeno-canto.org/api/2/recordings"
 
-# Load species list with common & scientific names
+# Load species list
 labels_url = 'https://raw.githubusercontent.com/mi3nts/mDashSupport/main/resources/birdCalls/labels.csv'
 df_species = pd.read_csv(labels_url)
 
-# Load taxonomy data (make sure this CSV file is present in your folder)
-df_full_taxonomy = pd.read_csv("eBird_taxonomy_v2024.csv", sep=",")
-# Only keep needed columns
-df_full_taxonomy = df_full_taxonomy[['PRIMARY_COM_NAME', 'SCI_NAME', 'ORDER', 'FAMILY', 'SPECIES_CODE']]
-
-# Setup DuckDB database & table for metadata
-con = duckdb.connect("audio_metadata.db")
+# Set up DuckDB database
+db_path = os.path.join(main_audio_folder, "audio_metadata.db")
+con = duckdb.connect(db_path)
 con.execute("""
 CREATE TABLE IF NOT EXISTS metadata (
     source TEXT,
@@ -56,47 +55,26 @@ CREATE TABLE IF NOT EXISTS metadata (
 )
 """)
 
+# Sanitize names for folder paths
 def sanitize(name):
-    """Sanitize folder and filenames to remove problematic characters."""
-    return re.sub(r'[\\/*?:"<>|]', '', name.replace(' ', '_'))
+    return re.sub(r'[\\/*?:"<>|]', '', str(name).replace(' ', '_'))
 
-def get_taxonomy_info(common_name, scientific_name):
-    row = df_full_taxonomy[
-        (df_full_taxonomy['PRIMARY_COM_NAME'] == common_name) & 
-        (df_full_taxonomy['SCI_NAME'] == scientific_name)
-    ]
-    if not row.empty:
-        return row.iloc[0]['ORDER'], row.iloc[0]['FAMILY']
-    else:
-        print(f"Taxonomy info not found for {common_name} / {scientific_name}")
-        return None, None
-
-def get_taxon_code(scientific_name, common_name):
-    row = df_full_taxonomy[
-        (df_full_taxonomy['PRIMARY_COM_NAME'] == common_name) &
-        (df_full_taxonomy['SCI_NAME'] == scientific_name)
-    ]
-    if not row.empty:
-        return row.iloc[0]['SPECIES_CODE']  # Use SPECIES_CODE as taxonCode
-    else:
-        print(f"No taxon code found for {common_name} / {scientific_name}")
-        return None
-
-def find_audio_asset_ids(taxon_code, max_items=21):
-    params = {
-        "taxonCode": taxon_code,
-        "mediaType": "audio",
-        "limit": max_items
-    }
+# Taxonomy fetch from GBIF
+def get_taxonomy_from_gbif(scientific_name):
     try:
-        response = requests.get(MACAULAY_URL, params=params, timeout=10)
+        response = requests.get(f"https://api.gbif.org/v1/species/match?name={scientific_name}", timeout=10)
         response.raise_for_status()
-        content = response.json().get('results', {}).get('content', [])
-        return content[:max_items]
+        data = response.json()
+        return {
+            'class': data.get('class'),
+            'order': data.get('order'),
+            'family': data.get('family'),
+        }
     except Exception as e:
-        print(f"API error for taxon {taxon_code}: {str(e)}")
-        return []
+        print(f"❌ Taxonomy fetch failed for {scientific_name}: {e}")
+        return {'class': 'Unknown', 'order': 'Unknown', 'family': 'Unknown'}
 
+# Save metadata to DuckDB
 def store_metadata(meta):
     con.execute("""
         INSERT INTO metadata VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -106,41 +84,87 @@ def store_metadata(meta):
         meta.get('license'), meta.get('url'), meta.get('filename')
     ))
 
+# Download audio + json metadata
 def download_audio(species_folder, filename, url, metadata):
     try:
         filepath = os.path.join(species_folder, filename)
         jsonpath = filepath.rsplit(".", 1)[0] + ".json"
         if os.path.exists(filepath):
-            print(f"Already exists: {filename}")
-            return False
-        
+            print(f"↪️ Already exists: {filename}")
+            return True
+
         response = requests.get(url, timeout=15)
         response.raise_for_status()
 
         with open(filepath, 'wb') as f:
             f.write(response.content)
-        print(f"✓ Saved: {filename}")
-
-        # Save metadata JSON file alongside audio
-        with open(jsonpath, 'w', encoding='utf-8') as jf:
-            json.dump(metadata, jf, indent=2)
-
-        # Store metadata in DuckDB
+        with open(jsonpath, 'w') as f:
+            json.dump(metadata, f, indent=2)
         store_metadata(metadata)
+        print(f"✓ Saved: {filename}")
         return True
     except Exception as e:
-        print(f"Download failed for {filename}: {str(e)}")
+        print(f"❌ Download failed for {filename}: {e}")
         return False
 
-def fetch_xeno_canto(common_name, scientific_name, species_folder, max_items=21):
-    print(f"🔎 Searching Xeno-Canto for: {scientific_name}")
+# Macaulay download using scientific name
+def fetch_macaulay(scientific_name, common_name, species_folder):
+    print(f"🔎 Searching Macaulay: {scientific_name}")
+    base_params = {
+        "query": scientific_name,
+        "mediaType": "audio",
+        
+    }
+    url = MACAULAY_URL
+    while url:
+        try:
+            response = requests.get(url, params=base_params if url == MACAULAY_URL else {}, timeout=10)
+            response.raise_for_status()
+            json_data = response.json()
+            results = json_data.get('results', {}).get('content', [])
+            for item in results:
+                asset_id = item.get("assetId")
+                if not asset_id:
+                    continue
+                audio_url = f"https://cdn.download.ams.birds.cornell.edu/api/v1/asset/{asset_id}/audio"
+                filename = f"{sanitize(common_name)}_ML_{asset_id}.mp3"
+                metadata = {
+                    "source": "Macaulay Library",
+                    "id": asset_id,
+                    "species": item.get("scientificName"),
+                    "common_name": common_name,
+                    "location": item.get("location"),
+                    "date": item.get("date"),
+                    "recordist": item.get("recordist"),
+                    "country": item.get("country"),
+                    "license": item.get("license"),
+                    "url": f"https://macaulaylibrary.org/asset/{asset_id}",
+                    "filename": filename
+                }
+                download_audio(species_folder, filename, audio_url, metadata)
+            
+            # Go to next page
+            url = json_data.get('results', {}).get('next')
+        except Exception as e:
+            print(f"❌ Macaulay error for {scientific_name}: {e}")
+            break
+
+
+# Xeno-Canto fetch
+def fetch_xeno_canto(common_name, scientific_name, species_folder):
+    print(f"🔎 Searching Xeno-Canto: {scientific_name}")
     try:
-        query = f"sp:{scientific_name.lower().replace(' ', '+')}"
-        response = requests.get(f"{XENO_CANTO_URL}?query={query}", timeout=10)
+        params = {'query': scientific_name}
+        response = requests.get(XENO_CANTO_URL, params=params, timeout=10)
         response.raise_for_status()
-        recordings = response.json().get('recordings', [])[:max_items]
-        for item in recordings:
-            file_url = f"https:{item['file']}" if item['file'].startswith("//") else item['file']
+        data = response.json()
+        num = data.get('numRecordings', len(data.get('recordings', [])))
+        print(f"  → Found {num} recordings on Xeno‑Canto")
+        
+        for item in data.get('recordings', []):
+            file_url = item['file']
+            if file_url.startswith("//"):
+                file_url = "https:" + file_url
             filename = f"{sanitize(common_name)}_XC_{item['id']}.mp3"
             metadata = {
                 "source": "Xeno-Canto",
@@ -155,60 +179,36 @@ def fetch_xeno_canto(common_name, scientific_name, species_folder, max_items=21)
                 "url": f"https://xeno-canto.org/{item['id']}",
                 "filename": filename
             }
-            if download_audio(species_folder, filename, file_url, metadata):
-                time.sleep(1)
+            download_audio(species_folder, filename, file_url, metadata)
+                
     except Exception as e:
-        print(f"Xeno-Canto error for {scientific_name}: {e}")
+        print(f"❌ Xeno‑Canto error for {scientific_name}: {e}")
 
+# === MAIN ===
 def main():
     print("=====================================")
     print("  Macaulay + Xeno-Canto Downloader")
-    print("=====================================")
+    print("  Taxonomic Folder Hierarchy: Class > Order > Family > Species")
+    print("=====================================\n")
 
-    for idx, row in df_species.iterrows():
+    for _, row in df_species.iterrows():
         common_name = row['Common name']
         scientific_name = row['Scientific name']
 
-        order, family = get_taxonomy_info(common_name, scientific_name)
-        if order and family:
-            folder_path = os.path.join(main_audio_folder, sanitize(order), sanitize(family), sanitize(common_name))
-        else:
-            folder_path = os.path.join(main_audio_folder, sanitize(common_name))
+        taxonomy = get_taxonomy_from_gbif(scientific_name)
+        cls = sanitize(taxonomy['class'])
+        order = sanitize(taxonomy['order'])
+        family = sanitize(taxonomy['family'])
+        species_folder = os.path.join(main_audio_folder, cls, order, family, sanitize(common_name))
+        os.makedirs(species_folder, exist_ok=True)
 
-        os.makedirs(folder_path, exist_ok=True)
+        # Download from Macaulay using scientific name
+        fetch_macaulay(scientific_name, common_name, species_folder)
 
-        taxon_code = get_taxon_code(scientific_name, common_name)
-        if taxon_code:
-            print(f"🔎 Searching Macaulay Library for taxon code: {taxon_code}")
-            macaulay_results = find_audio_asset_ids(taxon_code, max_items=21)
-            for item in macaulay_results:
-                asset_id = item.get("assetId")
-                if not asset_id:
-                    continue
-                audio_url = f"https://cdn.download.ams.birds.cornell.edu/api/v1/asset/{asset_id}/audio"
-                filename = f"{sanitize(common_name)}_ML_{asset_id}.mp3"
-                metadata = {
-                    "source": "Macaulay Library",
-                    "id": str(asset_id),
-                    "species": item.get('scientificName'),
-                    "common_name": common_name,
-                    "location": item.get('location'),
-                    "date": item.get('date'),
-                    "recordist": item.get('recordist'),
-                    "country": item.get('country'),
-                    "license": item.get('license'),
-                    "url": f"https://macaulaylibrary.org/asset/{asset_id}",
-                    "filename": filename
-                }
-                download_audio(folder_path, filename, audio_url, metadata)
-                time.sleep(1)
-        else:
-            print(f"No taxon code for {common_name}, skipping Macaulay.")
+        # Also try Xeno-Canto
+        fetch_xeno_canto(common_name, scientific_name, species_folder)
 
-        # Always fetch from Xeno-Canto as fallback or supplement
-        fetch_xeno_canto(common_name, scientific_name, folder_path, max_items=21)
-
-    print("\n✅ Download completed and metadata stored in DuckDB.")
+    print("\n✅ Download complete. Metadata saved to DuckDB.")
 
 if __name__ == "__main__":
     main()

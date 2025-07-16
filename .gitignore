@@ -6,3 +6,4 @@ credentials.yaml
 __pycache__/
 *.pyc
 .DS_Store
+credentials.yaml:Zone.Identifier
